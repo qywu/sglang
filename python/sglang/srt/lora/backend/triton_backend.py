@@ -142,6 +142,13 @@ class TritonLoRABackend(BaseLoRABackend):
                 out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
             )
 
+            # Pre-allocate token_lora_indices for CUDA graph mode (used by MoE LoRA)
+            # Max tokens = max_bs * num_tokens_per_bs
+            max_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+            self.cuda_graph_token_lora_indices = torch.zeros(
+                max_tokens, dtype=torch.int32
+            )
+
     def prepare_lora_batch(
         self,
         forward_batch: ForwardBatch,

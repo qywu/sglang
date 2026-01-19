@@ -113,7 +113,7 @@ class LoRAAdapter(nn.Module):
                 )
 
         # normalize kv_proj and gate_up_proj
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
@@ -174,6 +174,8 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        import re
+
         for weight_name in weight_names:
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
@@ -185,9 +187,44 @@ class LoRAAdapter(nn.Module):
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
                     )
-                weights[gate_up_name] = torch.cat(
-                    (weights[weight_name], weights[up_name]), 0
-                )
+
+                # Check if this is an MoE weight (has experts.X. in the name)
+                is_moe = re.search(r"experts\.\d+\.", weight_name) is not None
+
+                if "lora_A" in weight_name:
+                    # For lora_A: simple concatenation along dim 0
+                    # gate_proj.lora_A: [rank, hidden] + up_proj.lora_A: [rank, hidden]
+                    # -> gate_up_proj.lora_A: [2*rank, hidden]
+                    weights[gate_up_name] = torch.cat(
+                        (weights[weight_name], weights[up_name]), 0
+                    )
+                elif is_moe:
+                    # For MoE lora_B: create block-diagonal structure
+                    # The per_expert_lora kernel uses effective_rank = rank * 2 for gate_up_proj,
+                    # which means B needs to have 2*rank columns.
+                    # gate_proj.lora_B: [intermediate, rank]
+                    # up_proj.lora_B: [intermediate, rank]
+                    # -> gate_up_proj.lora_B: [2*intermediate, 2*rank] (block-diagonal)
+                    # This structure ensures correct computation:
+                    #   intermediate_gate @ B_gate^T goes to first half of output
+                    #   intermediate_up @ B_up^T goes to second half of output
+                    gate_weight = weights[weight_name]
+                    up_weight = weights[up_name]
+                    inter_dim, rank = gate_weight.shape
+                    # Create block-diagonal matrix
+                    gate_up_b = torch.zeros(
+                        2 * inter_dim, 2 * rank, dtype=gate_weight.dtype
+                    )
+                    gate_up_b[:inter_dim, :rank] = gate_weight  # Upper-left block
+                    gate_up_b[inter_dim:, rank:] = up_weight  # Lower-right block
+                    weights[gate_up_name] = gate_up_b
+                else:
+                    # For standard (non-MoE) lora_B: simple concatenation
+                    # The run_gate_up_lora kernel handles this format correctly
+                    weights[gate_up_name] = torch.cat(
+                        (weights[weight_name], weights[up_name]), 0
+                    )
+
                 weights.pop(weight_name)
                 if up_name in weights:
                     weights.pop(up_name)
